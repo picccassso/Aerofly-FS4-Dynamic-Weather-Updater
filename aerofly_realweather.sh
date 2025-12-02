@@ -216,13 +216,16 @@ sync_time() {
 
 # ------------ Flight Type Menu -------------------------
 flight_type_menu() {
-  echo -e "${BOLD}${BLUE}What type of flight?${RESET}"
-  echo "  1. Full flight (origin → destination)"
-  echo "  2. Take off only"
-  echo "  3. Landing only"
-  echo -e -n "${BOLD}Choose [1-3]: ${RESET}"
+  echo "" >&2
+  echo -e "${BOLD}${BLUE}What type of flight?${RESET}" >&2
+  echo "  1. Full flight (origin → destination)" >&2
+  echo "  2. Take off only" >&2
+  echo "  3. Landing only" >&2
+  echo "" >&2
+  echo -n -e "${BOLD}Choose [1-3]: ${RESET}" >&2
   read -r CHOICE
-  echo "$CHOICE"
+  # Only output the choice, not the menu
+  printf "%s" "$CHOICE"
 }
 
 # ------------ Single Airport Processing ----------------
@@ -360,19 +363,19 @@ main() {
     FLIGHT_TYPE=$(flight_type_menu)
     case "$FLIGHT_TYPE" in
       1)
-        echo "Start ICAO (origin):"; read -r START
-        echo "End ICAO (destination):"; read -r END
-        echo "Sync system UTC time? (y/n):"; read -r SYNC_TIME_FLAG
+        echo -n "Start ICAO (origin): "; read -r START
+        echo -n "End ICAO (destination): "; read -r END
+        echo -n "Sync system UTC time? (y/n): "; read -r SYNC_TIME_FLAG
         process_full_flight "$START" "$END" "$SYNC_TIME_FLAG"
         ;;
       2)
-        echo "Airport ICAO:"; read -r START
-        echo "Sync system UTC time? (y/n):"; read -r SYNC_TIME_FLAG
+        echo -n "Airport ICAO: "; read -r START
+        echo -n "Sync system UTC time? (y/n): "; read -r SYNC_TIME_FLAG
         process_single_airport "$START" "$SYNC_TIME_FLAG"
         ;;
       3)
-        echo "Airport ICAO:"; read -r END
-        echo "Sync system UTC time? (y/n):"; read -r SYNC_TIME_FLAG
+        echo -n "Airport ICAO: "; read -r END
+        echo -n "Sync system UTC time? (y/n): "; read -r SYNC_TIME_FLAG
         process_single_airport "$END" "$SYNC_TIME_FLAG"
         ;;
       *)
