@@ -50,29 +50,33 @@ fetch_metar() {
 parse_metar() {
   local METAR="$1"
 
-  # WIND PARSING (handles VRB and calm)
-    local WIND DIR SPD GUST
-    WIND=$(echo "$METAR" | grep -oE '[0-9]{3}[0-9]{2}(G[0-9]{2})?KT' | head -n1)
+# WIND PARSING (handles VRB and calm)
+local WIND DIR SPD GUST
+WIND=$(echo "$METAR" | grep -oE '\b([0-9]{3}|VRB)[0-9]{2}(G[0-9]{2})?KT\b' | head -n1)
 
-    if [[ -z "$WIND" ]]; then
-        if echo "$METAR" | grep -q "VRB"; then
-            DIR=180  # midpoint reference for variable
+if [[ -z "$WIND" ]]; then
+    if echo "$METAR" | grep -q "VRB"; then
+        DIR=180
         SPD=$(echo "$METAR" | grep -oE 'VRB[0-9]{2}' | grep -oE '[0-9]{2}' | head -n1)
         GUST=$(echo "$METAR" | grep -oE 'G[0-9]{2}' | tr -d G)
     else
-        # calm or missing: set fixed calm reference
         DIR=0; SPD=0; GUST=0
     fi
+else
+    if [[ "$WIND" == VRB* ]]; then
+        DIR=180
+        SPD=$(echo "$WIND" | grep -oE '[0-9]{2}' | head -n1)
     else
         DIR=$(echo "$WIND" | cut -c1-3)
         SPD=$(echo "$WIND" | cut -c4-5)
-        GUST=$(echo "$WIND" | grep -oE 'G[0-9]{2}' | tr -d G)
     fi
+    GUST=$(echo "$WIND" | grep -oE 'G[0-9]{2}' | tr -d G)
+fi
 
-  [ -z "$GUST" ] && GUST="$SPD"
-  DIR=$(safe_number "$DIR" 0)
-  SPD=$(safe_number "$SPD" 0)
-  GUST=$(safe_number "$GUST" "$SPD")
+[[ -z "$GUST" ]] && GUST="$SPD"
+DIR=$(safe_number "$DIR" 0)
+SPD=$(safe_number "$SPD" 0)
+GUST=$(safe_number "$GUST" "$SPD")
 
   # VISIBILITY
   local VIS
@@ -247,7 +251,7 @@ main() {
 
   apply_weather "$DIR" "$WN" "$VN" "$HN" "$DN" "$TN" "$CDN" "$CHN" "$THM"
 
-  if [[ "$SYNC_TIME_FLAG" =~ ^[Yy-]*sync.*$ ]]; then
+  if [[ "$SYNC_TIME_FLAG" =~ ^([Yy]|[Yy][Ee][Ss]|--sync)$ ]]; then
     sync_time
   fi
 
