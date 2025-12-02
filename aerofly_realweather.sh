@@ -41,9 +41,15 @@ safe_number() {
 
 # ------------ Fetch METAR -------------------------------
 fetch_metar() {
-  local ICAO="$1"
-  curl -fs "https://tgftp.nws.noaa.gov/data/observations/metar/stations/${ICAO}.TXT" \
-    2>/dev/null | tail -n 1
+  # Normalize station code to uppercase to prevent 301/empty fetch
+  local ICAO=$(echo "$1" | tr '[:lower:]' '[:upper:]')
+  local METAR_LINE
+  METAR_LINE=$(curl -fs "https://tgftp.nws.noaa.gov/data/observations/metar/stations/${ICAO}.TXT" \
+    2>/dev/null | tail -n 1 | tr -d '\r\n')
+  if [[ -z "$METAR_LINE" ]]; then
+    echo "Warning: No METAR data returned for ${ICAO}" >&2
+  fi
+  echo "$METAR_LINE"
 }
 
 # ------------ Parse METAR -------------------------------
@@ -147,6 +153,8 @@ GUST=$(safe_number "$GUST" "$SPD")
   }')
   if (( $(echo "$TBN < 0.1" | bc -l) )); then TBN=0.1; fi
 
+  echo "DEBUG parse_metar: METAR=$METAR" >&2
+  echo "DEBUG parse_metar: DIR=$DIR WN=$WN VN=$VN HN=$HN CLOUD_DENS=$CLOUD_DENS TBN=$TBN" >&2
   echo "$DIR;$WN;$VN;$HN;$CLOUD_DENS;$TBN"
 }
 
@@ -247,6 +255,8 @@ main() {
 
   IFS=';' read CDN CHN THM VN <<< "$(compute_derived "$VN" "$HN" "$DN" "$WN" "$TN")"
 
+  echo "DEBUG: D1='$D1' D2='$D2' DIR='$DIR'" >&2
+
   cp "$MCF" "$MCF.bak"
 
   apply_weather "$DIR" "$WN" "$VN" "$HN" "$DN" "$TN" "$CDN" "$CHN" "$THM"
@@ -256,7 +266,8 @@ main() {
   fi
 
   echo -e "\n${CYAN}--- Final Weather Summary ---${RESET}"
-  echo "Wind Direction: $DIR°"
+  echo "DEBUG before echo: DIR variable = '$DIR' (length: ${#DIR})" >&2
+  printf "Wind Direction: %s°\n" "$DIR"
   echo "Wind Strength : $WN"
   echo "Visibility    : $VN"
   echo "Cloud Base    : $HN"
