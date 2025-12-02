@@ -153,8 +153,6 @@ GUST=$(safe_number "$GUST" "$SPD")
   }')
   if (( $(echo "$TBN < 0.1" | bc -l) )); then TBN=0.1; fi
 
-  echo "DEBUG parse_metar: METAR=$METAR" >&2
-  echo "DEBUG parse_metar: DIR=$DIR WN=$WN VN=$VN HN=$HN CLOUD_DENS=$CLOUD_DENS TBN=$TBN" >&2
   echo "$DIR;$WN;$VN;$HN;$CLOUD_DENS;$TBN"
 }
 
@@ -255,8 +253,6 @@ main() {
 
   IFS=';' read CDN CHN THM VN <<< "$(compute_derived "$VN" "$HN" "$DN" "$WN" "$TN")"
 
-  echo "DEBUG: D1='$D1' D2='$D2' DIR='$DIR'" >&2
-
   cp "$MCF" "$MCF.bak"
 
   apply_weather "$DIR" "$WN" "$VN" "$HN" "$DN" "$TN" "$CDN" "$CHN" "$THM"
@@ -266,7 +262,6 @@ main() {
   fi
 
   echo -e "\n${CYAN}--- Final Weather Summary ---${RESET}"
-  echo "DEBUG before echo: DIR variable = '$DIR' (length: ${#DIR})" >&2
   printf "Wind Direction: %s°\n" "$DIR"
   echo "Wind Strength : $WN"
   echo "Visibility    : $VN"
