@@ -2,17 +2,16 @@
 # =======================================================
 # Aerofly FS4 Dynamic Weather Updater
 # =======================================================
-# DESCRIPTION:
-#   Fetches METAR weather from two ICAO stations,
-#   averages conditions, and updates Aerofly FS4's main.mcf
-#   with realistic, blended conditions including:
-#   - wind direction, strength, turbulence
-#   - visibility
-#   - cumulus density & height (multi-layer)
-#   - cirrus density & height
-#   - thermal activity
+# Fetches METAR weather for two ICAO stations,
+# averages conditions, and updates Aerofly FS4's main.mcf
+# with realistic blended weather including:
+#   - wind (direction, strength, turbulence)
+#   - visibility (nonlinear perception curve)
+#   - cumulus clouds (multi-layer avg density & height)
+#   - cirrus clouds (derived density & height)
+#   - thermal activity and seasonal bias
 #   - optional UTC time synchronization
-#   - cross-platform (macOS & Linux)
+# Works on macOS and Linux.
 # =======================================================
 
 MCF="$HOME/Library/Application Support/Aerofly FS 4/main.mcf"
@@ -43,22 +42,36 @@ safe_number() {
 # ------------ Fetch METAR -------------------------------
 fetch_metar() {
   local ICAO="$1"
-  local DATA
-  DATA=$(curl -fs "https://tgftp.nws.noaa.gov/data/observations/metar/stations/${ICAO}.TXT" 2>/dev/null | tail -n 1)
-  echo "$DATA"
+  curl -fs "https://tgftp.nws.noaa.gov/data/observations/metar/stations/${ICAO}.TXT" \
+    2>/dev/null | tail -n 1
 }
 
 # ------------ Parse METAR -------------------------------
 parse_metar() {
   local METAR="$1"
 
-  # WIND
-  local WIND DIR SPD GUST
-  WIND=$(echo "$METAR" | grep -oE '[0-9]{3}[0-9]{2}(G[0-9]{2})?KT' | head -n1)
-  DIR=$(safe_number "$(echo "$WIND" | cut -c1-3)" 0)
-  SPD=$(safe_number "$(echo "$WIND" | cut -c4-5)" 0)
-  GUST=$(echo "$WIND" | grep -oE 'G[0-9]{2}' | tr -d G)
+  # WIND PARSING (handles VRB and calm)
+    local WIND DIR SPD GUST
+    WIND=$(echo "$METAR" | grep -oE '[0-9]{3}[0-9]{2}(G[0-9]{2})?KT' | head -n1)
+
+    if [[ -z "$WIND" ]]; then
+        if echo "$METAR" | grep -q "VRB"; then
+            DIR=180  # midpoint reference for variable
+        SPD=$(echo "$METAR" | grep -oE 'VRB[0-9]{2}' | grep -oE '[0-9]{2}' | head -n1)
+        GUST=$(echo "$METAR" | grep -oE 'G[0-9]{2}' | tr -d G)
+    else
+        # calm or missing: set fixed calm reference
+        DIR=0; SPD=0; GUST=0
+    fi
+    else
+        DIR=$(echo "$WIND" | cut -c1-3)
+        SPD=$(echo "$WIND" | cut -c4-5)
+        GUST=$(echo "$WIND" | grep -oE 'G[0-9]{2}' | tr -d G)
+    fi
+
   [ -z "$GUST" ] && GUST="$SPD"
+  DIR=$(safe_number "$DIR" 0)
+  SPD=$(safe_number "$SPD" 0)
   GUST=$(safe_number "$GUST" "$SPD")
 
   # VISIBILITY
@@ -67,7 +80,7 @@ parse_metar() {
   VIS=$(safe_number "$VIS" 9999)
 
   # CLOUDS (multi-layer average)
-  local CLOUDS LAYERS COUNT SUM_DEN SUM_HT
+  local CLOUDS COUNT SUM_DEN SUM_HT
   CLOUDS=$(echo "$METAR" | grep -oE '(FEW|SCT|BKN|OVC)[0-9]{3}')
   SUM_DEN=0; SUM_HT=0; COUNT=0
 
@@ -104,17 +117,31 @@ parse_metar() {
   WN=$(echo "scale=3; $SPD/40" | bc)
   (( $(echo "$WN > 1" | bc -l) )) && WN=1.0
 
-  VN=$(echo "scale=3; $VIS/20000" | bc)
-  (( $(echo "$VN > 1" | bc -l) )) && VN=1.0
+  # Nonlinear visibility scaling
+  VN=$(awk -v vis="$VIS" '
+  BEGIN {
+      max_vis = 50000
+      scale = vis / max_vis
+      if (scale > 1) scale = 1
+      if (scale < 0) scale = 0
+      val = 1 - exp(-5 * scale)
+      print (val > 1 ? 1 : val)
+  }')
 
   HN=$(echo "scale=3; $CLOUD_HT_M/3000" | bc)
   (( $(echo "$HN > 1" | bc -l) )) && HN=1.0
 
+  # Nonlinear turbulence mapping
   DIFF=$(echo "$GUST - $SPD" | bc)
   (( $(echo "$DIFF < 0" | bc -l) )) && DIFF=0
-  TBN=$(echo "scale=3; $DIFF/10" | bc)
-  (( $(echo "$TBN > 1" | bc -l) )) && TBN=1.0
-  (( $(echo "$TBN < 0.1" | bc -l) )) && TBN=0.1
+  TBN=$(awk -v diff="$DIFF" 'BEGIN {
+      val = diff / 20
+      if (val < 0.05) val = 0.05
+      if (val > 1) val = 1
+      adj = val^1.6
+      print adj
+  }')
+  if (( $(echo "$TBN < 0.1" | bc -l) )); then TBN=0.1; fi
 
   echo "$DIR;$WN;$VN;$HN;$CLOUD_DENS;$TBN"
 }
@@ -123,8 +150,7 @@ parse_metar() {
 compute_derived() {
   local VN="$1" HN="$2" DN="$3" WN="$4" TN="$5"
 
-  # Cirrus
-  local CDN CHN
+  local CDN CHN THM MONTH
   CDN=$(echo "scale=3; (1 - $VN) * 0.6 + ($DN * 0.4)" | bc)
   (( $(echo "$CDN > 1" | bc -l) )) && CDN=1.0
   (( $(echo "$CDN < 0.05" | bc -l) )) && CDN=0.05
@@ -132,13 +158,9 @@ compute_derived() {
   CHN=$(echo "scale=3; $HN * 3" | bc)
   (( $(echo "$CHN > 1" | bc -l) )) && CHN=1.0
 
-  # Thermal activity
-  local THM
   THM=$(echo "scale=3; $DN * 0.5 + $WN * 0.3 + (1 - $VN) * 0.2" | bc)
   (( $(echo "$THM > 1" | bc -l) )) && THM=1.0
 
-  # Seasonal bias
-  local MONTH
   MONTH=$(date +%m)
   if (( MONTH < 3 || MONTH > 10 )); then
     THM=$(echo "$THM * 0.8" | bc)
@@ -148,13 +170,12 @@ compute_derived() {
   echo "$CDN;$CHN;$THM;$VN"
 }
 
-# ------------ Safe update utility -----------------------
+# ------------ MCF Utilities -----------------------------
 update_mcf() {
   local KEY="$1" VALUE="$2"
   $SED_CMD "s|<\[float64\]\[$KEY\].*|<[float64][$KEY][$VALUE]>|g" "$MCF"
 }
 
-# ------------ Apply updates -----------------------------
 apply_weather() {
   local DIR WN VN HN DN TN CDN CHN THM
   DIR="$1"; WN="$2"; VN="$3"; HN="$4"; DN="$5"; TN="$6"; CDN="$7"; CHN="$8"; THM="$9"
@@ -170,7 +191,6 @@ apply_weather() {
   update_mcf "thermal_activity" "$THM"
 }
 
-# ------------ UTC Time Sync -----------------------------
 sync_time() {
   local YEAR MON DAY HOUR_DEC
   YEAR=$(date -u +"%Y")
@@ -206,16 +226,13 @@ main() {
 
   if [[ -z "$M1" || -z "$M2" ]]; then
     echo -e "${YELLOW}METAR fetch failed. Using clear weather.${RESET}"
-    WN=0; VN=1; HN=1; DN=0; TN=0.1; CDN=0.05; CHN=1; THM=0.2; DIR=0
-    apply_weather "$DIR" "$WN" "$VN" "$HN" "$DN" "$TN" "$CDN" "$CHN" "$THM"
+    apply_weather 0 0 1 1 0 0.1 0.05 1 0.2
     exit 0
   fi
 
-  # Parse both METARs
   IFS=';' read D1 W1 V1N H1N C1N T1N <<< "$(parse_metar "$M1")"
   IFS=';' read D2 W2 V2N H2N C2N T2N <<< "$(parse_metar "$M2")"
 
-  # Averages
   local DIR WN VN HN DN TN
   DIR=$(( (D1 + D2) / 2 ))
   WN=$(echo "scale=3; ($W1 + $W2)/2" | bc)
@@ -224,21 +241,16 @@ main() {
   DN=$(echo "scale=3; ($C1N + $C2N)/2" | bc)
   TN=$(echo "scale=3; ($T1N + $T2N)/2" | bc)
 
-  # Compute derived parameters
   IFS=';' read CDN CHN THM VN <<< "$(compute_derived "$VN" "$HN" "$DN" "$WN" "$TN")"
 
-  # Backup before writing
   cp "$MCF" "$MCF.bak"
 
-  # Apply
   apply_weather "$DIR" "$WN" "$VN" "$HN" "$DN" "$TN" "$CDN" "$CHN" "$THM"
 
-  # Sync time if needed
   if [[ "$SYNC_TIME_FLAG" =~ ^[Yy-]*sync.*$ ]]; then
     sync_time
   fi
 
-  # Summary
   echo -e "\n${CYAN}--- Final Weather Summary ---${RESET}"
   echo "Wind Direction: $DIR°"
   echo "Wind Strength : $WN"
