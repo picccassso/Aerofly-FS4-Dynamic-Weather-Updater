@@ -42,33 +42,74 @@ the simulator's UTC time. The script runs on macOS and Linux.
 
 ### Interactive Mode
 
-Run the script and enter ICAO codes when prompted:
+Run the script and choose your flight type:
 
 ```bash
 ./aerofly_realweather.sh
 ```
 
-Example:
+You'll be presented with a menu:
 ```
-Start ICAO: EGGW
-End ICAO:   EGCC
+What type of flight?
+  1. Full flight (origin → destination)
+  2. Take off only
+  3. Landing only
+Choose [1-3]:
+```
+
+**Option 1: Full flight**
+```
+Start ICAO (origin): EGGW
+End ICAO (destination): EGCC
 Sync system UTC time? (y/n): y
 ```
+Fetches and averages weather from both airports.
 
-### Automatic / Non-Interactive Mode
+**Option 2: Take off only**
+```
+Airport ICAO: KJFK
+Sync system UTC time? (y/n): y
+```
+Fetches weather for the departure airport only.
 
-Run the script with both ICAO codes and optionally `--sync-time`:
+**Option 3: Landing only**
+```
+Airport ICAO: KLAX
+Sync system UTC time? (y/n): y
+```
+Fetches weather for the arrival airport only.
 
+### Non-Interactive / Automatic Mode
+
+Use flags to run without prompts. Three flight modes available:
+
+**Full flight** (blends two airports):
 ```bash
-./aerofly_realweather.sh EGGW EGCC --sync-time
+./aerofly_realweather.sh --full EGGW EGCC --sync-time
 ```
 
-To skip UTC sync:
+**Take off only** (single airport):
 ```bash
-./aerofly_realweather.sh KJFK KLAX
+./aerofly_realweather.sh --takeoff KJFK --sync-time
 ```
 
-This version runs without user input — ideal for automation.
+**Landing only** (single airport):
+```bash
+./aerofly_realweather.sh --landing KLAX --sync-time
+```
+
+Omit `--sync-time` to skip UTC synchronization:
+```bash
+./aerofly_realweather.sh --full KJFK KLAX
+./aerofly_realweather.sh --takeoff KJFK
+./aerofly_realweather.sh --landing KLAX
+```
+
+**Legacy mode** (backward compatible):
+```bash
+./aerofly_realweather.sh EGGW EGCC
+```
+Running with two ICAO codes (no flag) defaults to full flight mode.
 
 ## Example Output
 

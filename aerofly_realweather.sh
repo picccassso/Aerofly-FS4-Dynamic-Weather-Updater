@@ -214,19 +214,65 @@ sync_time() {
   $SED_CMD "s|<\[float64\]\[time_hours\].*|<[float64][time_hours][$HOUR_DEC]>|g" "$MCF"
 }
 
-# ------------ Main --------------------------------------
-main() {
-  local START END SYNC_TIME_FLAG
+# ------------ Flight Type Menu -------------------------
+flight_type_menu() {
+  echo -e "${BOLD}${BLUE}What type of flight?${RESET}"
+  echo "  1. Full flight (origin → destination)"
+  echo "  2. Take off only"
+  echo "  3. Landing only"
+  echo -e -n "${BOLD}Choose [1-3]: ${RESET}"
+  read -r CHOICE
+  echo "$CHOICE"
+}
 
-  if [[ "$1" && "$2" ]]; then
-    START="$1"
-    END="$2"
-    SYNC_TIME_FLAG="$3"
-  else
-    echo "Start ICAO:"; read START
-    echo "End ICAO:"; read END
-    echo "Sync system UTC time? (y/n)"; read SYNC_TIME_FLAG
+# ------------ Single Airport Processing ----------------
+process_single_airport() {
+  local ICAO="$1"
+  local SYNC_TIME_FLAG="$2"
+
+  echo -e "${BOLD}${BLUE}Fetching METAR for $ICAO...${RESET}"
+
+  local METAR
+  METAR=$(fetch_metar "$ICAO")
+
+  if [[ -z "$METAR" ]]; then
+    echo -e "${YELLOW}METAR fetch failed. Using clear weather.${RESET}"
+    apply_weather 0 0 1 1 0 0.1 0.05 1 0.2
+    exit 0
   fi
+
+  IFS=';' read D W VN HN CN TN <<< "$(parse_metar "$METAR")"
+
+  IFS=';' read CDN CHN THM VN <<< "$(compute_derived "$VN" "$HN" "$CN" "$W" "$TN")"
+
+  cp "$MCF" "$MCF.bak"
+
+  apply_weather "$D" "$W" "$VN" "$HN" "$CN" "$TN" "$CDN" "$CHN" "$THM"
+
+  if [[ "$SYNC_TIME_FLAG" =~ ^([Yy]|[Yy][Ee][Ss]|--sync)$ ]]; then
+    sync_time
+  fi
+
+  echo -e "\n${CYAN}--- Final Weather Summary ---${RESET}"
+  printf "Wind Direction: %s°\n" "$D"
+  echo "Wind Strength : $W"
+  echo "Visibility    : $VN"
+  echo "Cloud Base    : $HN"
+  echo "Cumulus Dens. : $CN"
+  echo "Cirrus Height : $CHN"
+  echo "Cirrus Dens.  : $CDN"
+  echo "Turbulence    : $TN"
+  echo "Thermals      : $THM"
+  [[ "$SYNC_TIME_FLAG" =~ ^[Yy-]*sync.*$ ]] && echo "UTC Time Sync : enabled"
+  echo -e "${CYAN}Weather successfully updated in Aerofly FS4.${RESET}\n"
+}
+
+# ------------ Process Full Flight ----------------------
+process_full_flight() {
+  local START END SYNC_TIME_FLAG
+  START="$1"
+  END="$2"
+  SYNC_TIME_FLAG="$3"
 
   echo -e "${BOLD}${BLUE}Fetching METARs for $START and $END...${RESET}"
 
@@ -273,6 +319,68 @@ main() {
   echo "Thermals      : $THM"
   [[ "$SYNC_TIME_FLAG" =~ ^[Yy-]*sync.*$ ]] && echo "UTC Time Sync : enabled"
   echo -e "${CYAN}Weather successfully updated in Aerofly FS4.${RESET}\n"
+}
+
+# ------------ Main --------------------------------------
+main() {
+  local FLIGHT_TYPE START END SYNC_TIME_FLAG
+
+  # Check for non-interactive mode with arguments
+  if [[ "$1" =~ ^--(full|takeoff|landing)$ ]]; then
+    FLIGHT_TYPE="$1"
+    case "$FLIGHT_TYPE" in
+      --full)
+        START="$2"
+        END="$3"
+        SYNC_TIME_FLAG="$4"
+        [[ -z "$START" || -z "$END" ]] && { echo "Error: --full requires two ICAO codes"; exit 1; }
+        process_full_flight "$START" "$END" "$SYNC_TIME_FLAG"
+        ;;
+      --takeoff)
+        START="$2"
+        SYNC_TIME_FLAG="$3"
+        [[ -z "$START" ]] && { echo "Error: --takeoff requires one ICAO code"; exit 1; }
+        process_single_airport "$START" "$SYNC_TIME_FLAG"
+        ;;
+      --landing)
+        END="$2"
+        SYNC_TIME_FLAG="$3"
+        [[ -z "$END" ]] && { echo "Error: --landing requires one ICAO code"; exit 1; }
+        process_single_airport "$END" "$SYNC_TIME_FLAG"
+        ;;
+    esac
+  elif [[ "$1" && "$2" ]]; then
+    # Legacy mode: two arguments without flag (assume full flight)
+    START="$1"
+    END="$2"
+    SYNC_TIME_FLAG="$3"
+    process_full_flight "$START" "$END" "$SYNC_TIME_FLAG"
+  else
+    # Interactive mode: show flight type menu
+    FLIGHT_TYPE=$(flight_type_menu)
+    case "$FLIGHT_TYPE" in
+      1)
+        echo "Start ICAO (origin):"; read -r START
+        echo "End ICAO (destination):"; read -r END
+        echo "Sync system UTC time? (y/n):"; read -r SYNC_TIME_FLAG
+        process_full_flight "$START" "$END" "$SYNC_TIME_FLAG"
+        ;;
+      2)
+        echo "Airport ICAO:"; read -r START
+        echo "Sync system UTC time? (y/n):"; read -r SYNC_TIME_FLAG
+        process_single_airport "$START" "$SYNC_TIME_FLAG"
+        ;;
+      3)
+        echo "Airport ICAO:"; read -r END
+        echo "Sync system UTC time? (y/n):"; read -r SYNC_TIME_FLAG
+        process_single_airport "$END" "$SYNC_TIME_FLAG"
+        ;;
+      *)
+        echo "Invalid choice. Exiting."
+        exit 1
+        ;;
+    esac
+  fi
 }
 
 main "$@"
