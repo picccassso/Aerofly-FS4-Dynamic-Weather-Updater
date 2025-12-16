@@ -23,6 +23,7 @@ the simulator's UTC time. The script runs on macOS and Linux.
 - Optional synchronization of Aerofly FS4's time to current UTC
 - Automatic backup of your "main.mcf" before modification
 - Works in interactive or automatic (no-prompt) mode
+- Current position weather mode (detects aircraft location and finds nearest airport)
 
 ## Installation
 
@@ -54,7 +55,8 @@ What type of flight?
   1. Full flight (origin → destination)
   2. Take off only
   3. Landing only
-Choose [1-3]:
+  4. Current position (cruise weather)
+Choose [1-4]:
 ```
 
 **Option 1: Full flight**
@@ -79,9 +81,24 @@ Sync system UTC time? (y/n): y
 ```
 Fetches weather for the arrival airport only.
 
+**Option 4: Current position (cruise)**
+```
+Detecting current aircraft position...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Current Position:
+  Latitude  : 51.123456°
+  Longitude : -0.456789°
+  Altitude  : 35000 ft (10668 m)
+  Speed     : 450.0 kts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Nearest airport: EGLL
+Sync system UTC time? (y/n): y
+```
+Reads your current aircraft position from the MCF file, finds the nearest airport, and fetches its weather.
+
 ### Non-Interactive / Automatic Mode
 
-Use flags to run without prompts. Three flight modes available:
+Use flags to run without prompts. Four flight modes available:
 
 **Full flight** (blends two airports):
 ```bash
@@ -98,11 +115,17 @@ Use flags to run without prompts. Three flight modes available:
 ./aerofly_realweather.sh --landing KLAX --sync-time
 ```
 
+**Current position** (cruise weather):
+```bash
+./aerofly_realweather.sh --cruise --sync-time
+```
+
 Omit `--sync-time` to skip UTC synchronization:
 ```bash
 ./aerofly_realweather.sh --full KJFK KLAX
 ./aerofly_realweather.sh --takeoff KJFK
 ./aerofly_realweather.sh --landing KLAX
+./aerofly_realweather.sh --cruise
 ```
 
 **Legacy mode** (backward compatible):
