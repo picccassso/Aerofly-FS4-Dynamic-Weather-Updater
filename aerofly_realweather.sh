@@ -11,6 +11,7 @@
 #   - cirrus clouds (derived density & height)
 #   - thermal activity and seasonal bias
 #   - optional UTC time synchronization
+#   - current position weather (cruise)
 # Works on macOS and Linux.
 # =======================================================
 
@@ -39,12 +40,160 @@ safe_number() {
   fi
 }
 
+# ------------ Convert ECEF to Lat/Lon -------------------
+ecef_to_latlon() {
+  local X="$1" Y="$2" Z="$3"
+  
+  # WGS84 ellipsoid constants
+  local A=6378137.0  # Semi-major axis
+  local E2=0.00669437999014  # First eccentricity squared
+  
+  # Calculate using awk for floating point math
+  awk -v x="$X" -v y="$Y" -v z="$Z" -v a="$A" -v e2="$E2" '
+  BEGIN {
+    pi = 3.14159265358979323846
+    
+    # Longitude
+    lon = atan2(y, x) * 180 / pi
+    
+    # Latitude (iterative method)
+    p = sqrt(x*x + y*y)
+    lat = atan2(z, p * (1 - e2))
+    
+    for (i = 0; i < 5; i++) {
+      sin_lat = sin(lat)
+      N = a / sqrt(1 - e2 * sin_lat * sin_lat)
+      lat = atan2(z + e2 * N * sin_lat, p)
+    }
+    
+    lat = lat * 180 / pi
+    
+    printf "%.6f;%.6f", lat, lon
+  }'
+}
+
+# ------------ Get Full Position with Altitude -----------
+get_current_position_full() {
+  if [[ ! -f "$MCF" ]]; then
+    echo "Error: MCF file not found at $MCF" >&2
+    return 1
+  fi
+  
+  local POSITION VELOCITY X Y Z VX VY VZ
+  
+  # Extract position and velocity
+  POSITION=$(awk '
+    /<\[tmsettings_flight\]\[flight_setting\]/ { in_flight=1 }
+    in_flight && /<\[vector3_float64\]\[position\]/ {
+      match($0, /\[[-0-9. ]+\]/)
+      print substr($0, RSTART+1, RLENGTH-2)
+      exit
+    }
+  ' "$MCF")
+  
+  VELOCITY=$(awk '
+    /<\[tmsettings_flight\]\[flight_setting\]/ { in_flight=1 }
+    in_flight && /<\[vector3_float64\]\[velocity\]/ {
+      match($0, /\[[-0-9. ]+\]/)
+      print substr($0, RSTART+1, RLENGTH-2)
+      exit
+    }
+  ' "$MCF")
+  
+  if [[ -z "$POSITION" ]]; then
+    echo "Error: Could not extract aircraft position" >&2
+    return 1
+  fi
+  
+  # Parse coordinates
+  X=$(echo "$POSITION" | awk '{print $1}')
+  Y=$(echo "$POSITION" | awk '{print $2}')
+  Z=$(echo "$POSITION" | awk '{print $3}')
+  
+  VX=$(echo "$VELOCITY" | awk '{print $1}')
+  VY=$(echo "$VELOCITY" | awk '{print $2}')
+  VZ=$(echo "$VELOCITY" | awk '{print $3}')
+  
+  # Convert to lat/lon
+  local LATLON LAT LON
+  LATLON=$(ecef_to_latlon "$X" "$Y" "$Z")
+  IFS=';' read -r LAT LON <<< "$LATLON"
+  
+  # Calculate altitude MSL
+  local ALT_M
+  ALT_M=$(awk -v x="$X" -v y="$Y" -v z="$Z" '
+  BEGIN {
+    r = sqrt(x*x + y*y + z*z)
+    alt = r - 6378137.0
+    printf "%.0f", alt
+  }')
+  
+  # Calculate ground speed
+  local GS_MS GS_KTS
+  GS_MS=$(awk -v vx="$VX" -v vy="$VY" -v vz="$VZ" '
+  BEGIN {
+    speed = sqrt(vx*vx + vy*vy + vz*vz)
+    printf "%.1f", speed
+  }')
+  
+  GS_KTS=$(echo "scale=1; $GS_MS * 1.94384" | bc)
+  
+  echo "$LAT;$LON;$ALT_M;$GS_KTS"
+}
+
+# ------------ Find Nearest Airport to Coordinates ------
+find_nearest_airport() {
+  local LAT="$1"
+  local LON="$2"
+  
+  # Download and cache the airports CSV
+  local AIRPORTS_CSV="/tmp/ourairports_cache.csv"
+  
+  if [[ ! -f "$AIRPORTS_CSV" ]] || \
+     [[ $(find "$AIRPORTS_CSV" -mtime +7 2>/dev/null) ]]; then
+    curl -s -o "$AIRPORTS_CSV" \
+      "https://davidmegginson.github.io/ourairports-data/airports.csv" \
+      2>/dev/null
+    
+    if [[ ! -s "$AIRPORTS_CSV" ]]; then
+      echo "Error: Failed to download airports database" >&2
+      return 1
+    fi
+  fi
+  
+  # Query nearest airport
+  local NEAREST_ICAO
+  NEAREST_ICAO=$(awk -F',' -v lat="$LAT" -v lon="$LON" '
+    NR>1 && ($3=="\"large_airport\"" || $3=="\"medium_airport\"" || $3=="\"small_airport\"") {
+      gsub(/"/, "", $5)
+      gsub(/"/, "", $6)
+      gsub(/"/, "", $2)
+      alat=$5
+      alon=$6
+      icao=$2
+      
+      if (alat != "" && alon != "" && icao != "") {
+        dist = sqrt((alat-lat)^2 + (alon-lon)^2)
+        if (min=="" || dist<min) {
+          min=dist
+          best_icao=icao
+        }
+      }
+    }
+    END {
+      if (best_icao != "") print best_icao
+    }' "$AIRPORTS_CSV")
+  
+  echo "$NEAREST_ICAO"
+}
+
 # ------------ Fetch METAR -------------------------------
 fetch_metar() {
   # Normalize station code to uppercase to prevent 301/empty fetch
   local ICAO=$(echo "$1" | tr '[:lower:]' '[:upper:]')
   local METAR_LINE
-  METAR_LINE=$(curl -fs "https://tgftp.nws.noaa.gov/data/observations/metar/stations/${ICAO}.TXT" \
+  METAR_LINE=$(curl -fs \
+    "https://tgftp.nws.noaa.gov/data/observations/metar/stations/${ICAO}.TXT" \
     2>/dev/null | tail -n 1 | tr -d '\r\n')
   if [[ -z "$METAR_LINE" ]]; then
     echo "Warning: No METAR data returned for ${ICAO}" >&2
@@ -56,33 +205,35 @@ fetch_metar() {
 parse_metar() {
   local METAR="$1"
 
-# WIND PARSING (handles VRB and calm)
-local WIND DIR SPD GUST
-WIND=$(echo "$METAR" | grep -oE '\b([0-9]{3}|VRB)[0-9]{2}(G[0-9]{2})?KT\b' | head -n1)
+  # WIND PARSING (handles VRB and calm)
+  local WIND DIR SPD GUST
+  WIND=$(echo "$METAR" | \
+    grep -oE '\b([0-9]{3}|VRB)[0-9]{2}(G[0-9]{2})?KT\b' | head -n1)
 
-if [[ -z "$WIND" ]]; then
+  if [[ -z "$WIND" ]]; then
     if echo "$METAR" | grep -q "VRB"; then
-        DIR=180
-        SPD=$(echo "$METAR" | grep -oE 'VRB[0-9]{2}' | grep -oE '[0-9]{2}' | head -n1)
-        GUST=$(echo "$METAR" | grep -oE 'G[0-9]{2}' | tr -d G)
+      DIR=180
+      SPD=$(echo "$METAR" | grep -oE 'VRB[0-9]{2}' | \
+        grep -oE '[0-9]{2}' | head -n1)
+      GUST=$(echo "$METAR" | grep -oE 'G[0-9]{2}' | tr -d G)
     else
-        DIR=0; SPD=0; GUST=0
+      DIR=0; SPD=0; GUST=0
     fi
-else
+  else
     if [[ "$WIND" == VRB* ]]; then
-        DIR=180
-        SPD=$(echo "$WIND" | grep -oE '[0-9]{2}' | head -n1)
+      DIR=180
+      SPD=$(echo "$WIND" | grep -oE '[0-9]{2}' | head -n1)
     else
-        DIR=$(echo "$WIND" | cut -c1-3)
-        SPD=$(echo "$WIND" | cut -c4-5)
+      DIR=$(echo "$WIND" | cut -c1-3)
+      SPD=$(echo "$WIND" | cut -c4-5)
     fi
     GUST=$(echo "$WIND" | grep -oE 'G[0-9]{2}' | tr -d G)
-fi
+  fi
 
-[[ -z "$GUST" ]] && GUST="$SPD"
-DIR=$(safe_number "$DIR" 0)
-SPD=$(safe_number "$SPD" 0)
-GUST=$(safe_number "$GUST" "$SPD")
+  [[ -z "$GUST" ]] && GUST="$SPD"
+  DIR=$(safe_number "$DIR" 0)
+  SPD=$(safe_number "$SPD" 0)
+  GUST=$(safe_number "$GUST" "$SPD")
 
   # VISIBILITY
   local VIS
@@ -180,6 +331,95 @@ compute_derived() {
   echo "$CDN;$CHN;$THM;$VN"
 }
 
+# ------------ Get Airport Runways from OurAirports ------
+get_airport_runways() {
+  local ICAO="$1"
+  local WIND_DIR="$2"
+
+  # Fetch runway data for this airport from OurAirports
+  local RUNWAYS
+  RUNWAYS=$(curl -s \
+    "https://davidmegginson.github.io/ourairports-data/runways.csv" \
+    2>/dev/null | grep "\"$ICAO\"" | cut -d',' -f9,15)
+
+  if [[ -z "$RUNWAYS" ]]; then
+    # Fallback to generic suggestion if lookup fails
+    suggest_runway "$WIND_DIR"
+    return
+  fi
+
+  # Parse runway data and find matches for the wind direction
+  local SUGGESTED_RWY
+  SUGGESTED_RWY=$(suggest_runway "$WIND_DIR")
+
+  # Extract the base runway number (without L/R/C suffix)
+  local SUGGESTED_BASE=${SUGGESTED_RWY:0:2}
+  local SUGGESTED_HDG=$((SUGGESTED_BASE * 10))
+
+  # Get all runway designations for this airport
+  local RWY_LIST
+  RWY_LIST=$(echo "$RUNWAYS" | tr ',' '\n' | tr -d '"' | \
+    grep -v '^$' | sort -u)
+
+  # Find runways matching the suggested direction
+  local MATCHING_RWYS
+  MATCHING_RWYS=$(echo "$RWY_LIST" | grep "^$SUGGESTED_BASE" | \
+    tr '\n' '/' | sed 's/\/$//')
+
+  if [[ -n "$MATCHING_RWYS" ]]; then
+    echo "$MATCHING_RWYS"
+  else
+    # If no exact match, find the closest runway heading
+    local BEST_RWY=""
+    local BEST_DIFF=9999
+
+    while read -r RWY; do
+      [[ -z "$RWY" ]] && continue
+      # Extract runway number (first 2 chars), use base 10 to avoid octal
+      local RWY_NUM=${RWY:0:2}
+      local RWY_HDG=$((10#$RWY_NUM * 10))
+
+      # Calculate angular distance (shortest path around 360°)
+      local DIFF=$((WIND_DIR - RWY_HDG))
+      [[ $DIFF -lt 0 ]] && DIFF=$((DIFF + 360))
+      [[ $DIFF -gt 180 ]] && DIFF=$((360 - DIFF))
+
+      # Keep track of closest runway
+      if [[ $DIFF -lt $BEST_DIFF ]]; then
+        BEST_DIFF=$DIFF
+        BEST_RWY="$RWY"
+      fi
+    done <<< "$RWY_LIST"
+
+    # Show recommended runway followed by all others
+    if [[ -n "$BEST_RWY" ]]; then
+      echo "$BEST_RWY (recommended) / $(echo "$RWY_LIST" | \
+        grep -v "^$BEST_RWY" | tr '\n' '/' | sed 's/\/$//')"
+    else
+      echo "$RWY_LIST" | tr '\n' '/' | sed 's/\/$//'
+    fi
+  fi
+}
+
+# ------------ Suggest Runway Based on Wind --------------
+suggest_runway() {
+  local WIND_DIR="$1"
+  local RUNWAY
+
+  # Round wind direction to nearest 10 for runway number
+  RUNWAY=$(( (WIND_DIR + 5) / 10 ))
+
+  # Handle wraparound (36 wraps to 01)
+  if (( RUNWAY > 35 )); then
+    RUNWAY=1
+  elif (( RUNWAY == 0 )); then
+    RUNWAY=36
+  fi
+
+  # Format as two digits
+  printf "%02d" "$RUNWAY"
+}
+
 # ------------ MCF Utilities -----------------------------
 update_mcf() {
   local KEY="$1" VALUE="$2"
@@ -188,7 +428,8 @@ update_mcf() {
 
 apply_weather() {
   local DIR WN VN HN DN TN CDN CHN THM
-  DIR="$1"; WN="$2"; VN="$3"; HN="$4"; DN="$5"; TN="$6"; CDN="$7"; CHN="$8"; THM="$9"
+  DIR="$1"; WN="$2"; VN="$3"; HN="$4"; DN="$5"
+  TN="$6"; CDN="$7"; CHN="$8"; THM="$9"
 
   update_mcf "direction_in_degree" "$DIR"
   update_mcf "strength" "$WN"
@@ -208,27 +449,33 @@ sync_time() {
   DAY=$(date -u +"%d")
   HOUR_DEC=$(echo "scale=6; $(date -u +%H) + ($(date -u +%M)/60)" | bc)
 
-  $SED_CMD "s|<\[int32\]\[time_year\].*|<[int32][time_year][$YEAR]>|g" "$MCF"
-  $SED_CMD "s|<\[int32\]\[time_month\].*|<[int32][time_month][$MON]>|g" "$MCF"
-  $SED_CMD "s|<\[int32\]\[time_day\].*|<[int32][time_day][$DAY]>|g" "$MCF"
-  $SED_CMD "s|<\[float64\]\[time_hours\].*|<[float64][time_hours][$HOUR_DEC]>|g" "$MCF"
+  $SED_CMD \
+    "s|<\[int32\]\[time_year\].*|<[int32][time_year][$YEAR]>|g" "$MCF"
+  $SED_CMD \
+    "s|<\[int32\]\[time_month\].*|<[int32][time_month][$MON]>|g" "$MCF"
+  $SED_CMD \
+    "s|<\[int32\]\[time_day\].*|<[int32][time_day][$DAY]>|g" "$MCF"
+  $SED_CMD \
+    "s|<\[float64\]\[time_hours\].*|<[float64][time_hours][$HOUR_DEC]>|g" \
+    "$MCF"
 }
 
-# ------------ Flight Type Menu -------------------------
+# ------------ Flight Type Menu --------------------------
 flight_type_menu() {
   echo "" >&2
   echo -e "${BOLD}${BLUE}What type of flight?${RESET}" >&2
   echo "  1. Full flight (origin → destination)" >&2
   echo "  2. Take off only" >&2
   echo "  3. Landing only" >&2
+  echo "  4. Current position (cruise weather)" >&2
   echo "" >&2
-  echo -n -e "${BOLD}Choose [1-3]: ${RESET}" >&2
+  echo -n -e "${BOLD}Choose [1-4]: ${RESET}" >&2
   read -r CHOICE
   # Only output the choice, not the menu
   printf "%s" "$CHOICE"
 }
 
-# ------------ Single Airport Processing ----------------
+# ------------ Single Airport Processing -----------------
 process_single_airport() {
   local ICAO="$1"
   local SYNC_TIME_FLAG="$2"
@@ -246,7 +493,8 @@ process_single_airport() {
 
   IFS=';' read D W VN HN CN TN <<< "$(parse_metar "$METAR")"
 
-  IFS=';' read CDN CHN THM VN <<< "$(compute_derived "$VN" "$HN" "$CN" "$W" "$TN")"
+  IFS=';' read CDN CHN THM VN <<< \
+    "$(compute_derived "$VN" "$HN" "$CN" "$W" "$TN")"
 
   cp "$MCF" "$MCF.bak"
 
@@ -257,7 +505,8 @@ process_single_airport() {
   fi
 
   echo -e "\n${CYAN}--- Final Weather Summary ---${RESET}"
-  printf "Wind Direction: %s°\n" "$D"
+  printf "Wind Direction: %s° (Runway %s)\n" "$D" \
+    "$(get_airport_runways "$ICAO" "$D")"
   echo "Wind Strength : $W"
   echo "Visibility    : $VN"
   echo "Cloud Base    : $HN"
@@ -266,11 +515,12 @@ process_single_airport() {
   echo "Cirrus Dens.  : $CDN"
   echo "Turbulence    : $TN"
   echo "Thermals      : $THM"
-  [[ "$SYNC_TIME_FLAG" =~ ^[Yy-]*sync.*$ ]] && echo "UTC Time Sync : enabled"
+  [[ "$SYNC_TIME_FLAG" =~ ^[Yy-]*sync.*$ ]] && \
+    echo "UTC Time Sync : enabled"
   echo -e "${CYAN}Weather successfully updated in Aerofly FS4.${RESET}\n"
 }
 
-# ------------ Process Full Flight ----------------------
+# ------------ Process Full Flight -----------------------
 process_full_flight() {
   local START END SYNC_TIME_FLAG
   START="$1"
@@ -300,7 +550,8 @@ process_full_flight() {
   DN=$(echo "scale=3; ($C1N + $C2N)/2" | bc)
   TN=$(echo "scale=3; ($T1N + $T2N)/2" | bc)
 
-  IFS=';' read CDN CHN THM VN <<< "$(compute_derived "$VN" "$HN" "$DN" "$WN" "$TN")"
+  IFS=';' read CDN CHN THM VN <<< \
+    "$(compute_derived "$VN" "$HN" "$DN" "$WN" "$TN")"
 
   cp "$MCF" "$MCF.bak"
 
@@ -310,8 +561,9 @@ process_full_flight() {
     sync_time
   fi
 
-  echo -e "\n${CYAN}--- Final Weather Summary ---${RESET}"
-  printf "Wind Direction: %s°\n" "$DIR"
+  echo -e "\n${CYAN}--- Final Weather Summary (Blended) ---${RESET}"
+  printf "Wind Direction: %s° (Runway %s at %s)\n" "$DIR" \
+    "$(get_airport_runways "$START" "$DIR")" "$START"
   echo "Wind Strength : $WN"
   echo "Visibility    : $VN"
   echo "Cloud Base    : $HN"
@@ -320,7 +572,8 @@ process_full_flight() {
   echo "Cirrus Dens.  : $CDN"
   echo "Turbulence    : $TN"
   echo "Thermals      : $THM"
-  [[ "$SYNC_TIME_FLAG" =~ ^[Yy-]*sync.*$ ]] && echo "UTC Time Sync : enabled"
+  [[ "$SYNC_TIME_FLAG" =~ ^[Yy-]*sync.*$ ]] && \
+    echo "UTC Time Sync : enabled"
   echo -e "${CYAN}Weather successfully updated in Aerofly FS4.${RESET}\n"
 }
 
@@ -329,27 +582,63 @@ main() {
   local FLIGHT_TYPE START END SYNC_TIME_FLAG
 
   # Check for non-interactive mode with arguments
-  if [[ "$1" =~ ^--(full|takeoff|landing)$ ]]; then
+  if [[ "$1" =~ ^--(full|takeoff|landing|cruise)$ ]]; then
     FLIGHT_TYPE="$1"
     case "$FLIGHT_TYPE" in
       --full)
         START="$2"
         END="$3"
         SYNC_TIME_FLAG="$4"
-        [[ -z "$START" || -z "$END" ]] && { echo "Error: --full requires two ICAO codes"; exit 1; }
+        [[ -z "$START" || -z "$END" ]] && \
+          { echo "Error: --full requires two ICAO codes"; exit 1; }
         process_full_flight "$START" "$END" "$SYNC_TIME_FLAG"
         ;;
       --takeoff)
         START="$2"
         SYNC_TIME_FLAG="$3"
-        [[ -z "$START" ]] && { echo "Error: --takeoff requires one ICAO code"; exit 1; }
+        [[ -z "$START" ]] && \
+          { echo "Error: --takeoff requires one ICAO code"; exit 1; }
         process_single_airport "$START" "$SYNC_TIME_FLAG"
         ;;
       --landing)
         END="$2"
         SYNC_TIME_FLAG="$3"
-        [[ -z "$END" ]] && { echo "Error: --landing requires one ICAO code"; exit 1; }
+        [[ -z "$END" ]] && \
+          { echo "Error: --landing requires one ICAO code"; exit 1; }
         process_single_airport "$END" "$SYNC_TIME_FLAG"
+        ;;
+      --cruise)
+        SYNC_TIME_FLAG="$2"
+        
+        echo -e "${BOLD}${CYAN}Detecting current aircraft position...${RESET}"
+        
+        IFS=';' read LAT LON ALT_M GS_KTS <<< "$(get_current_position_full)"
+        
+        if [[ $? -ne 0 ]]; then
+          echo "Failed to get position. Exiting."
+          exit 1
+        fi
+        
+        local ALT_FT
+        ALT_FT=$(echo "$ALT_M * 3.28084" | bc | awk '{printf "%.0f", $0}')
+        
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+        echo -e "${BOLD}Current Position:${RESET}"
+        echo "  Latitude  : ${LAT}°"
+        echo "  Longitude : ${LON}°"
+        echo "  Altitude  : ${ALT_FT} ft (${ALT_M} m)"
+        echo "  Speed     : ${GS_KTS} kts"
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+        
+        CURRENT_ICAO=$(find_nearest_airport "$LAT" "$LON")
+        
+        if [[ -z "$CURRENT_ICAO" ]]; then
+          echo "Could not find nearby airport. Exiting."
+          exit 1
+        fi
+        
+        echo -e "${CYAN}Nearest airport: ${BOLD}$CURRENT_ICAO${RESET}"
+        process_single_airport "$CURRENT_ICAO" "$SYNC_TIME_FLAG"
         ;;
     esac
   elif [[ "$1" && "$2" ]]; then
@@ -377,6 +666,38 @@ main() {
         echo -n "Airport ICAO: "; read -r END
         echo -n "Sync system UTC time? (y/n): "; read -r SYNC_TIME_FLAG
         process_single_airport "$END" "$SYNC_TIME_FLAG"
+        ;;
+      4)
+        echo -e "${BOLD}${CYAN}Detecting current aircraft position...${RESET}"
+        
+        IFS=';' read LAT LON ALT_M GS_KTS <<< "$(get_current_position_full)"
+        
+        if [[ $? -ne 0 ]]; then
+          echo "Failed to get position. Exiting."
+          exit 1
+        fi
+        
+        local ALT_FT
+        ALT_FT=$(echo "$ALT_M * 3.28084" | bc | awk '{printf "%.0f", $0}')
+        
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+        echo -e "${BOLD}Current Position:${RESET}"
+        echo "  Latitude  : ${LAT}°"
+        echo "  Longitude : ${LON}°"
+        echo "  Altitude  : ${ALT_FT} ft (${ALT_M} m)"
+        echo "  Speed     : ${GS_KTS} kts"
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+        
+        CURRENT_ICAO=$(find_nearest_airport "$LAT" "$LON")
+        
+        if [[ -z "$CURRENT_ICAO" ]]; then
+          echo "Could not find nearby airport. Exiting."
+          exit 1
+        fi
+        
+        echo -e "${CYAN}Nearest airport: ${BOLD}$CURRENT_ICAO${RESET}"
+        echo -n "Sync system UTC time? (y/n): "; read -r SYNC_TIME_FLAG
+        process_single_airport "$CURRENT_ICAO" "$SYNC_TIME_FLAG"
         ;;
       *)
         echo "Invalid choice. Exiting."
